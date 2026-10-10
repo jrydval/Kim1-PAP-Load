@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -18,6 +19,10 @@ type Port struct {
 	fd     int
 	closed atomic.Bool
 	saved  syscall.Termios
+	// reading is held during read(2). Close waits for it: once the saved
+	// (blocking) settings are back, a read in progress would never return,
+	// and on macOS close(2) waits for it, hanging the program on exit.
+	reading sync.Mutex
 }
 
 func ioctl(fd int, req uintptr, arg unsafe.Pointer) error {
@@ -77,6 +82,8 @@ func makeRaw(t *syscall.Termios) {
 
 // Read returns 0, nil when nothing arrived within ~100ms.
 func (p *Port) Read(b []byte) (int, error) {
+	p.reading.Lock()
+	defer p.reading.Unlock()
 	if p.closed.Load() {
 		return 0, errors.New("port closed")
 	}
@@ -112,6 +119,8 @@ func (p *Port) Close() error {
 	if p.closed.Swap(true) {
 		return nil
 	}
+	p.reading.Lock()
+	defer p.reading.Unlock()
 	ioctl(p.fd, ioctlSetAttr, unsafe.Pointer(&p.saved))
 	return syscall.Close(p.fd)
 }
