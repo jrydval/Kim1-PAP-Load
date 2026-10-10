@@ -1,4 +1,4 @@
-# kimload: KIM-1 PAP Load Util in Golang
+# Kim1-PAP-Load: KIM-1 PAP Load Util in Golang
 
 `kimload` sends a paper tape (`.pap` / `.ptp`) file to a **KIM-1**, or to a
 clone such as the **PAL-1 / PAL-2**, over the TTY serial port. It drives the
@@ -41,15 +41,15 @@ library.
 You need Go 1.27 or newer.
 
 ```sh
-go install github.com/jrydval/kimload@latest
+go install github.com/jrydval/Kim1-PAP-Load/cmd/kimload@latest
 ```
 
 Or from a clone:
 
 ```sh
-git clone https://github.com/jrydval/kimload.git
-cd kimload
-go build
+git clone https://github.com/jrydval/Kim1-PAP-Load.git
+cd Kim1-PAP-Load
+go build ./cmd/kimload
 ```
 
 Supported platforms: **macOS** and **Linux**. The serial port is driven
