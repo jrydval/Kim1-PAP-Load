@@ -29,6 +29,7 @@ type Monitor struct {
 	conn      Conn
 	in        chan byte
 	errc      chan error
+	baud      int
 	charTime  time.Duration
 	CharDelay time.Duration
 	LineDelay time.Duration
@@ -41,6 +42,7 @@ func NewMonitor(conn Conn, baud int) *Monitor {
 		conn:     conn,
 		in:       make(chan byte, 4096),
 		errc:     make(chan error, 1),
+		baud:     baud,
 		charTime: time.Duration(10 * float64(time.Second) / float64(baud)),
 	}
 	go m.reader()
@@ -318,20 +320,121 @@ func (m *Monitor) rejected(line int, got string) error {
 
 // Go starts the program at addr from the monitor prompt.
 func (m *Monitor) Go(addr uint16) error {
-	if err := m.send(fmt.Sprintf("%04X ", addr)); err != nil {
+	if err := m.command(fmt.Sprintf("%04X ", addr), addr); err != nil {
 		return err
-	}
-	got, err := m.collect(2*time.Second, hasPrompt)
-	if err != nil {
-		return err
-	}
-	if !hasPrompt(got) {
-		return &BoardError{Msg: fmt.Sprintf("the monitor did not accept address %04X", addr), Board: got}
 	}
 	if err := m.send("G"); err != nil {
 		return err
 	}
 	return m.quiet(200 * time.Millisecond)
+}
+
+// command types s at the monitor prompt and waits for the prompt that
+// shows addr.
+func (m *Monitor) command(s string, addr uint16) error {
+	if err := m.send(s); err != nil {
+		return err
+	}
+	want := fmt.Sprintf("%04X", addr)
+	got, err := m.collect(2*time.Second, func(s string) bool {
+		p := promptRe.FindStringSubmatch(s)
+		return p != nil && p[1] == want
+	})
+	if err != nil {
+		return err
+	}
+	if p := promptRe.FindStringSubmatch(got); p == nil || p[1] != want {
+		return &BoardError{
+			Msg:   fmt.Sprintf("the monitor did not answer %q with address %s", strings.TrimSpace(s), want),
+			Board: got,
+			Hints: []string{"press RS on the board and try again"},
+		}
+	}
+	return nil
+}
+
+// Dump-related monitor locations and the shape of what Q prints.
+const (
+	eaAddr       = 0x17F7 // end address for Q, low byte first
+	dumpRecBytes = 24     // Q always punches full 24-byte records
+	dumpRecChars = 67     // CR LF, 6 NULs, ';', count, address, data, checksum
+)
+
+var dumpEndRe = regexp.MustCompile(`;00[0-9A-F]{8}`)
+
+// DumpTime estimates how long Dump takes for n bytes.
+func DumpTime(n, baud int) time.Duration {
+	recs := (n + dumpRecBytes - 1) / dumpRecBytes
+	chars := (recs+1)*dumpRecChars + 3*8 // the records and the commands that set up Q
+	return time.Duration(chars) * time.Duration(10*float64(time.Second)/float64(baud))
+}
+
+// Dump reads memory from start to end (inclusive) with the monitor's Q
+// command, which punches it as paper tape: 24-byte records from the open
+// address for as long as that is below the end address stored at
+// $17F7/$17F8, then a terminator. The last record can run past end. Dump
+// overwrites $17F7/$17F8; afterwards the monitor waits for a command
+// without printing a prompt.
+func (m *Monitor) Dump(start, end uint16, progress func(bytes int)) (map[uint16]byte, error) {
+	ea := end + 1
+	if end == 0xFFFF {
+		ea = 0xFFFF
+	}
+	if err := m.quiet(100 * time.Millisecond); err != nil {
+		return nil, err
+	}
+	for _, c := range []struct {
+		s    string
+		addr uint16
+	}{
+		{fmt.Sprintf("%04X ", eaAddr), eaAddr},
+		{fmt.Sprintf("%02X.", byte(ea)), eaAddr + 1},
+		{fmt.Sprintf("%02X.", byte(ea>>8)), eaAddr + 2},
+		{fmt.Sprintf("%04X ", start), start},
+	} {
+		if err := m.command(c.s, c.addr); err != nil {
+			return nil, err
+		}
+	}
+	if err := m.send("Q"); err != nil {
+		return nil, err
+	}
+	n := int(end) - int(start) + 1
+	got, err := m.collect(2*DumpTime(n, m.baud)+3*time.Second, func(s string) bool {
+		if progress != nil && strings.HasSuffix(s, ";") {
+			progress(min(strings.Count(s, ";")-1, (n+dumpRecBytes-1)/dumpRecBytes) * dumpRecBytes)
+		}
+		return dumpEndRe.MatchString(s)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !dumpEndRe.MatchString(got) {
+		return nil, &BoardError{
+			Msg:   "the memory dump stopped before its end",
+			Board: lastLine(got),
+			Hints: []string{"press RS on the board and try again"},
+		}
+	}
+	tape, err := ParsePAP(strings.NewReader(got))
+	if err != nil {
+		return nil, &BoardError{
+			Msg:   "the memory dump arrived corrupted: " + err.Error(),
+			Hints: []string{"the line from the board is noisy - try again"},
+		}
+	}
+	mem := make(map[uint16]byte, n)
+	for _, r := range tape.Records {
+		for i, d := range r.Data {
+			mem[r.Addr+uint16(i)] = d
+		}
+	}
+	return mem, nil
+}
+
+func lastLine(s string) string {
+	s = strings.TrimRight(s, "\r\n")
+	return s[strings.LastIndexAny(s, "\r\n")+1:]
 }
 
 func printable(c byte) string {

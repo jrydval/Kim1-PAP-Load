@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,7 @@ func run() int {
 	charDelay := flag.Duration("char-delay", 3*time.Millisecond, "extra pause after each character")
 	lineDelay := flag.Duration("line-delay", 30*time.Millisecond, "extra pause after each record")
 	goAddr := flag.String("go", "", "after loading, start the program at this hex `address` (\"auto\" = the first record's address)")
+	verify := flag.Bool("verify", false, "after loading, read the memory back and compare it with the file")
 	dryRun := flag.Bool("n", false, "only check the file, don't send anything")
 	verbose := flag.Bool("v", false, "show everything the board sends")
 	flag.Usage = func() {
@@ -79,7 +81,15 @@ func run() int {
 	}
 	estimate := time.Duration(chars)*(time.Duration(10*float64(time.Second)/float64(*baud))+*charDelay+time.Millisecond) +
 		time.Duration(len(lines))*(*lineDelay)
-	u.Info("time", "about %s at %d baud", clock(estimate), *baud)
+	if *verify {
+		vt := time.Duration(0)
+		for _, s := range tape.Segments() {
+			vt += DumpTime(s.Len(), *baud)
+		}
+		u.Info("time", "about %s at %d baud, then about %s to verify", clock(estimate), *baud, clock(vt))
+	} else {
+		u.Info("time", "about %s at %d baud", clock(estimate), *baud)
+	}
 
 	var start uint16
 	if *goAddr != "" {
@@ -176,6 +186,9 @@ func run() int {
 	u.OK("loaded %d bytes in %d records in %s %s", tape.Bytes(), len(tape.Records), clock(took),
 		u.dim(fmt.Sprintf("(%.0f B/s)", float64(tape.Bytes())/took.Seconds())))
 
+	if *verify && !verifyTape(u, m, tape, showTrace) {
+		return 1
+	}
 	if *goAddr == "" {
 		u.Printf("  %s start it in the monitor with: %s", u.cyan("→"), u.bold(fmt.Sprintf("%04X G", tape.Records[0].Addr)))
 		return 0
@@ -189,6 +202,88 @@ func run() int {
 	}
 	done(true, "")
 	return 0
+}
+
+// verifyTape reads back every segment of the tape and compares it with
+// what was sent. It reports the outcome and says whether everything matched.
+func verifyTape(u *UI, m *Monitor, tape *Tape, showTrace func()) bool {
+	want := map[uint16]byte{}
+	for _, r := range tape.Records {
+		for i, d := range r.Data {
+			want[r.Addr+uint16(i)] = d
+		}
+	}
+	got := map[uint16]byte{}
+	for _, s := range tape.Segments() {
+		msg := fmt.Sprintf("verifying $%04X-$%04X", s.Start, s.End)
+		done := u.Step(msg)
+		mem, err := m.Dump(s.Start, s.End, func(n int) {
+			u.Live(fmt.Sprintf("  %s %s… %s", u.cyan("•"), msg, u.dim(fmt.Sprintf("%d/%d B", min(n, s.Len()), s.Len()))))
+		})
+		if err != nil {
+			done(false, "")
+			showTrace()
+			report(u, err)
+			return false
+		}
+		done(true, "")
+		showTrace()
+		for a, d := range mem {
+			got[a] = d
+		}
+	}
+
+	// Dump itself writes the end address for Q here.
+	skipped := 0
+	for a := uint16(eaAddr); a <= eaAddr+1; a++ {
+		if _, ok := want[a]; ok {
+			delete(want, a)
+			skipped++
+		}
+	}
+	addrs := make([]int, 0, len(want))
+	for a := range want {
+		addrs = append(addrs, int(a))
+	}
+	sort.Ints(addrs)
+	var bad []int
+	for _, a := range addrs {
+		if d, ok := got[uint16(a)]; !ok || d != want[uint16(a)] {
+			bad = append(bad, a)
+		}
+	}
+	if skipped > 0 {
+		u.Warn("$%04X-$%04X not verified: the verify itself uses them", eaAddr, eaAddr+1)
+	}
+	if len(bad) == 0 {
+		u.OK("verified %d bytes, all match", len(addrs))
+		return true
+	}
+
+	u.Fail(fmt.Sprintf("%d of %d bytes differ from the file", len(bad), len(addrs)), "", nil)
+	const show = 8
+	for _, a := range bad[:min(len(bad), show)] {
+		read := "not read"
+		if d, ok := got[uint16(a)]; ok {
+			read = fmt.Sprintf("read %02X", d)
+		}
+		u.Printf("  %s  expected %02X  %s", u.cyan(fmt.Sprintf("$%04X", a)), want[uint16(a)], read)
+	}
+	if len(bad) > show {
+		u.Printf("  %s", u.dim(fmt.Sprintf("… and %d more", len(bad)-show)))
+	}
+	first, same := got[uint16(bad[0])], true
+	for _, a := range bad {
+		if d, ok := got[uint16(a)]; !ok || d != first {
+			same = false
+			break
+		}
+	}
+	if same && len(bad) > 1 {
+		u.Printf("  %s every differing byte reads $%02X: is there RAM at $%04X-$%04X?", u.cyan("→"), first, bad[0], bad[len(bad)-1])
+	}
+	u.Printf("  %s load again; if the same bytes differ, that memory may be faulty", u.cyan("→"))
+	return false
 }
 
 func report(u *UI, err error) {

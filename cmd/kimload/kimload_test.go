@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -72,6 +73,8 @@ func TestParsePAPWarnings(t *testing.T) {
 // fakeKIM imitates the monitor ROM in TTY mode: every byte is echoed by
 // "hardware", CR prints a new prompt, RUBOUT after reset prints KIM, and
 // L runs the paper tape loader (ERR on a bad checksum, KIM at the end).
+// Hex digits, space and '.' open and modify memory, and Q punches it as
+// paper tape, the way the ROM does it.
 type fakeKIM struct {
 	mu      sync.Mutex
 	out     []byte
@@ -82,6 +85,42 @@ type fakeKIM struct {
 	corrupt int // corrupt the n-th data record (1-based), 0 = never
 	nrec    int
 	mem     map[uint16]byte
+	acc     uint16    // hex digits typed so far
+	point   uint16    // the open address
+	noRAM   [2]uint16 // writes here are lost and reads give $FF (if [1] > 0)
+}
+
+func (k *fakeKIM) read(a uint16) byte {
+	if a >= k.noRAM[0] && a <= k.noRAM[1] {
+		return 0xFF
+	}
+	return k.mem[a]
+}
+
+func (k *fakeKIM) write(a uint16, d byte) {
+	if !(a >= k.noRAM[0] && a <= k.noRAM[1]) {
+		k.mem[a] = d
+	}
+}
+
+func (k *fakeKIM) prompt() { k.say(fmt.Sprintf("\r\n%04X %02X ", k.point, k.read(k.point))) }
+
+func (k *fakeKIM) punch() {
+	ea := uint16(k.read(0x17F7)) | uint16(k.read(0x17F8))<<8
+	for n := uint16(0); ; n++ {
+		k.say("\r\n\x00\x00\x00\x00\x00\x00;")
+		if k.point >= ea {
+			k.say(fmt.Sprintf("00%04X%04X", n, n>>8+n&0xFF))
+			k.point = n
+			return
+		}
+		r := Record{Addr: k.point, Data: make([]byte, 24)}
+		for i := range r.Data {
+			r.Data[i] = k.read(k.point)
+			k.point++
+		}
+		k.say(r.PAP()[1:])
+	}
 }
 
 func (k *fakeKIM) Read(b []byte) (int, error) {
@@ -118,6 +157,19 @@ func (k *fakeKIM) Write(b []byte) (int, error) {
 			k.say("\r\n2000 4C ")
 		case c == 'L':
 			k.loading = true
+		case strings.IndexByte("0123456789ABCDEF", c) >= 0:
+			k.acc = k.acc<<4 | uint16(strings.IndexByte("0123456789ABCDEF", c))
+		case c == ' ':
+			k.point, k.acc = k.acc, 0
+			k.prompt()
+		case c == '.':
+			k.write(k.point, byte(k.acc))
+			k.point++
+			k.acc = 0
+			k.prompt()
+		case c == 'Q':
+			k.punch()
+			k.acc = 0
 		}
 	}
 	return len(b), nil
@@ -158,7 +210,7 @@ func (k *fakeKIM) load(c byte) {
 		return
 	}
 	for i, d := range r.Data {
-		k.mem[r.Addr+uint16(i)] = d
+		k.write(r.Addr+uint16(i), d)
 	}
 }
 
@@ -243,5 +295,61 @@ func TestLoadInterrupted(t *testing.T) {
 	var le *LoadError
 	if !errors.As(err, &le) || le.Msg != "interrupted" || le.Line != 0 {
 		t.Fatalf("Load() = %v", err)
+	}
+}
+
+func TestDump(t *testing.T) {
+	k := &fakeKIM{mem: map[uint16]byte{}}
+	for a := 0x0200; a < 0x0300; a++ {
+		k.mem[uint16(a)] = byte(a * 7)
+	}
+	m := newTestMonitor(k)
+	var last int
+	mem, err := m.Dump(0x0210, 0x0250, func(n int) { last = n })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for a := uint16(0x0210); a <= 0x0250; a++ {
+		if d, ok := mem[a]; !ok || d != byte(a*7) {
+			t.Fatalf("$%04X = %02X, %v", a, d, ok)
+		}
+	}
+	if len(mem) != 72 || last != 72 { // three full 24-byte records
+		t.Fatalf("dumped %d bytes, progress %d", len(mem), last)
+	}
+	if ea := uint16(k.mem[0x17F7]) | uint16(k.mem[0x17F8])<<8; ea != 0x0251 {
+		t.Fatalf("end address = %04X", ea)
+	}
+	// The monitor must still take commands afterwards.
+	if err := m.command("0200 ", 0x0200); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVerify(t *testing.T) {
+	tape, _ := ParsePAP(strings.NewReader(sample))
+	k := &fakeKIM{}
+	m := newTestMonitor(k)
+	if err := m.Load(context.Background(), tape.Lines(), nil); err != nil {
+		t.Fatal(err)
+	}
+	u := &UI{w: io.Discard}
+	if !verifyTape(u, m, tape, func() {}) {
+		t.Fatal("verify failed on a good load")
+	}
+
+	var out strings.Builder
+	k = &fakeKIM{noRAM: [2]uint16{0x2020, 0x2FFF}}
+	m = newTestMonitor(k)
+	if err := m.Load(context.Background(), tape.Lines(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if verifyTape(&UI{w: &out}, m, tape, func() {}) {
+		t.Fatal("verify passed with missing RAM")
+	}
+	for _, want := range []string{"16 of 48 bytes differ", "$2020  expected 00  read FF", "reads $FF: is there RAM at $2020-$202F?"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output lacks %q:\n%s", want, out.String())
+		}
 	}
 }

@@ -72,6 +72,14 @@ func (u *UI) Fail(msg string, board string, hints []string) {
 	}
 }
 
+// Live replaces the line in progress (from Step) with s, on a terminal.
+func (u *UI) Live(s string) {
+	if u.tty {
+		fmt.Fprint(u.w, "\r\x1b[K"+s)
+		u.live = true
+	}
+}
+
 // Step shows an action in progress; call the returned func with the outcome.
 func (u *UI) Step(msg string) func(ok bool, result string) {
 	if u.tty {
