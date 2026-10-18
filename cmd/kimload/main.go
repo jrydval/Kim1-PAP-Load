@@ -217,8 +217,14 @@ func verifyTape(u *UI, m *Monitor, tape *Tape, showTrace func()) bool {
 	for _, s := range tape.Segments() {
 		msg := fmt.Sprintf("verifying $%04X-$%04X", s.Start, s.End)
 		done := u.Step(msg)
+		began, estimate := time.Now(), DumpTime(s.Len(), m.baud)
 		mem, err := m.Dump(s.Start, s.End, func(n int) {
-			u.Live(fmt.Sprintf("  %s %s… %s", u.cyan("•"), msg, u.dim(fmt.Sprintf("%d/%d B", min(n, s.Len()), s.Len()))))
+			n = min(n, s.Len())
+			frac := float64(n) / float64(s.Len())
+			elapsed := time.Since(began)
+			u.Live(fmt.Sprintf("  %s %3d%%  %s  %s  %s %s", u.meter(frac), int(frac*100), msg,
+				u.dim(fmt.Sprintf("%d/%d B", n, s.Len())),
+				clock(elapsed), u.dim("~"+clock(remaining(elapsed, estimate, frac))+" left")))
 		})
 		if err != nil {
 			done(false, "")
@@ -226,7 +232,7 @@ func verifyTape(u *UI, m *Monitor, tape *Tape, showTrace func()) bool {
 			report(u, err)
 			return false
 		}
-		done(true, "")
+		done(true, clock(time.Since(began)))
 		showTrace()
 		for a, d := range mem {
 			got[a] = d

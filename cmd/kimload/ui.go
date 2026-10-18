@@ -139,13 +139,7 @@ func (b *Bar) Update(p Progress) {
 		bytes += b.recBytes[i]
 	}
 	elapsed := now.Sub(b.start)
-	left := b.estimate - elapsed
-	if frac > 0.05 {
-		left = time.Duration(float64(elapsed)/frac) - elapsed
-	}
-	if left < 0 {
-		left = 0
-	}
+	left := remaining(elapsed, b.estimate, frac)
 	recs := len(b.lines) - 1
 	rec := fmt.Sprintf("record %d/%d", min(p.Line+1, recs), recs)
 	if p.Line >= recs {
@@ -162,14 +156,28 @@ func (b *Bar) Update(p Progress) {
 		}
 		return
 	}
-	const width = 30
-	fill := int(frac * width)
-	bar := b.u.green(strings.Repeat("█", fill)) + b.u.dim(strings.Repeat("░", width-fill))
 	fmt.Fprintf(b.u.w, "\r\x1b[K  %s %3d%%  %s  %s  %s  %s %s",
-		bar, pct, rec, b.u.cyan(addr),
+		b.u.meter(frac), pct, rec, b.u.cyan(addr),
 		b.u.dim(fmt.Sprintf("%d/%d B", bytes, b.totalBytes)),
 		clock(elapsed), b.u.dim("~"+clock(left)+" left"))
 	b.u.live = true
+}
+
+// meter draws the bar itself, frac (0..1) of it filled.
+func (u *UI) meter(frac float64) string {
+	const width = 30
+	fill := min(max(int(frac*width), 0), width)
+	return u.green(strings.Repeat("█", fill)) + u.dim(strings.Repeat("░", width-fill))
+}
+
+// remaining guesses the time left: from the estimate at first, then from
+// the pace so far.
+func remaining(elapsed, estimate time.Duration, frac float64) time.Duration {
+	left := estimate - elapsed
+	if frac > 0.05 {
+		left = time.Duration(float64(elapsed)/frac) - elapsed
+	}
+	return max(left, 0)
 }
 
 func clock(d time.Duration) string {

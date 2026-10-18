@@ -127,7 +127,13 @@ prints the memory as PAP records, which are checked like any tape and
 compared with the file:
 
 ```
-  ✓ verifying $2000-$28FF
+  █████████████░░░░░░░░░░░░░░░░░  45%  verifying $2000-$28FF  1032/2304 B  0:04 ~0:05 left
+```
+
+and when it is done:
+
+```
+  ✓ verifying $2000-$28FF 0:08
 ✓ verified 2304 bytes, all match
 ```
 
