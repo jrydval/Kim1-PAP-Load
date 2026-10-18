@@ -33,6 +33,7 @@ type Monitor struct {
 	charTime  time.Duration
 	CharDelay time.Duration
 	LineDelay time.Duration
+	rx        int // bytes received so far
 	// Trace, if set, gets every byte received from the board.
 	Trace func(b byte)
 }
@@ -71,6 +72,7 @@ func (m *Monitor) recv(deadline time.Time) (byte, error) {
 	defer t.Stop()
 	select {
 	case b := <-m.in:
+		m.rx++
 		if m.Trace != nil {
 			m.Trace(b)
 		}
@@ -152,6 +154,7 @@ func (m *Monitor) Wake() (addr string, calibrated bool, err error) {
 	if err := m.quiet(150 * time.Millisecond); err != nil {
 		return "", false, err
 	}
+	rx := m.rx
 	if err := m.send("\r"); err != nil {
 		return "", false, err
 	}
@@ -184,9 +187,16 @@ func (m *Monitor) Wake() (addr string, calibrated bool, err error) {
 		"press RS on the board, so the monitor re-measures the baud rate",
 		"check that the TTY/keypad switch is set to TTY",
 	}
-	if board == "" || board == "\x7f" || board == "\r" {
+	switch {
+	case m.rx == rx:
 		hints = append([]string{"no echo at all: check the port, the cable and that the board is powered"}, hints...)
-	} else {
+	case board == "":
+		// Only the hardware echo came back: the line works, the CPU is busy.
+		hints = []string{
+			"the board echoes, so the line works, but the monitor is not listening - press RS on the board",
+			"if a program is running, RS stops it too; check that the TTY/keypad switch is set to TTY",
+		}
+	default:
 		hints = append([]string{"the reply looks garbled: the board may be calibrated to a different baud rate"}, hints...)
 	}
 	return "", false, &BoardError{Msg: "the KIM-1 monitor does not answer", Board: board, Hints: hints}
