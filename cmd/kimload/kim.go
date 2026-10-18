@@ -340,10 +340,15 @@ func (m *Monitor) Go(addr uint16) error {
 }
 
 // command types s at the monitor prompt and waits for the prompt that
-// shows addr.
+// shows addr. Like the tape, it goes one character at a time: at higher
+// baud rates the monitor misses a character that follows another one
+// back to back.
 func (m *Monitor) command(s string, addr uint16) error {
-	if err := m.send(s); err != nil {
-		return err
+	for i := 0; i < len(s); i++ {
+		if err := m.sendEcho(s[i], -1); err != nil {
+			return err
+		}
+		time.Sleep(m.CharDelay)
 	}
 	want := fmt.Sprintf("%04X", addr)
 	got, err := m.collect(2*time.Second, func(s string) bool {
